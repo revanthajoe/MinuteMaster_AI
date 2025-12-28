@@ -1,0 +1,16 @@
+Flask
+Flask-Cors
+Flask-SQLAlchemy
+faster-whisper
+torch
+torchaudio
+transformers
+sentencepiece
+huggingface_hub
+pydub
+simple-diarizer
+speechbrain
+numpy
+scipy
+requests
+protobuf

@@ -1,0 +1,537 @@
+import React, { useState, useRef } from 'react';
+import { Upload, Mic, StopCircle, FileText, BrainCircuit, MessageSquare, List, Gavel, Copy, Check, RefreshCw, Languages, XCircle } from 'lucide-react';
+
+// --- Configuration ---
+// The base URL for your Python backend server
+const BACKEND_URL = 'http://127.0.0.1:5000';
+
+// Main Application Component
+export default function App() {
+  // --- STATE MANAGEMENT ---
+  const [status, setStatus] = useState('idle'); // idle, recording, processing, transcribed, summarized, translating
+  const [fileName, setFileName] = useState('');
+  const [transcript, setTranscript] = useState([]);
+  const [summary, setSummary] = useState('');
+  const [summaryStyle, setSummaryStyle] = useState('professional');
+  const [sourceLanguage, setSourceLanguage] = useState('');
+  const [translatedSummary, setTranslatedSummary] = useState('');
+  const [error, setError] = useState(null);
+  const [isCopied, setIsCopied] = useState(false);
+  const [showPopup, setShowPopup] = useState(false);
+  const [popupMessage, setPopupMessage] = useState('');
+
+  // Refs for recording logic
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+
+  // --- UI-RELATED FUNCTIONS ---
+  const showNotification = (message) => {
+    setPopupMessage(message);
+    setShowPopup(true);
+    setTimeout(() => {
+      setShowPopup(false);
+      setPopupMessage('');
+    }, 3000);
+  };
+
+  // --- API FUNCTIONS ---
+  const checkServerStatus = async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/health`);
+      return response.ok;
+    } catch (err) {
+      return false;
+    }
+  };
+
+  const transcribeAndDiarize = async (audioBlob) => {
+    setStatus('processing');
+    setError(null);
+    setTranscript([]);
+    setSummary('');
+    setTranslatedSummary('');
+    setSourceLanguage('');
+    setIsCopied(false);
+
+    // Validate audio blob
+    if (!audioBlob) {
+      setError("No audio data received");
+      setStatus('idle');
+      return;
+    }
+
+    // Check file size
+    const maxSize = 100 * 1024 * 1024; // 100MB
+    if (audioBlob.size > maxSize) {
+      setError("Audio file is too large. Maximum size is 100MB.");
+      setStatus('idle');
+      return;
+    }
+
+    // Verify blob is readable
+    try {
+      const slice = audioBlob.slice(0, 4);
+      await slice.arrayBuffer();
+    } catch (e) {
+      setError("Audio file appears to be corrupted or unreadable");
+      setStatus('idle');
+      return;
+    }
+
+    const isServerUp = await checkServerStatus();
+    if (!isServerUp) {
+      setError("Cannot connect to the backend server. Please ensure it's running and try again.");
+      setStatus('idle');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('audio', audioBlob, fileName || 'live_recording.wav');
+
+    try {
+      // First validate the audio blob
+      if (!audioBlob || audioBlob.size === 0) {
+        throw new Error("Invalid audio file: The file appears to be empty");
+      }
+
+      const response = await fetch(`${BACKEND_URL}/transcribe`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      let errorMessage;
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        errorMessage = errorData.error || `Server error: ${response.statusText}`;
+        
+        // Enhance error messages for common issues
+        if (errorMessage.includes("system cannot find the file")) {
+          errorMessage = "Server failed to process the audio file. Please try again or use a different file.";
+        } else if (errorMessage.includes("Permission denied")) {
+          errorMessage = "Server doesn't have permission to process the file. Please contact support.";
+        } else if (errorMessage.includes("Failed to process audio")) {
+          errorMessage = "Unable to process the audio file. Please ensure it's a valid audio format and try again.";
+        }
+        
+        console.error("Server error:", errorMessage);
+        throw new Error(errorMessage);
+      }
+
+      const data = await response.json();
+      if (!data.transcript || !Array.isArray(data.transcript)) {
+        throw new Error("Invalid response from server: Missing transcript data");
+      }
+
+      const formattedTranscript = data.transcript.map(segment => ({
+        time: segment.time,
+        speaker: segment.speaker,
+        text: segment.text
+      }));
+      setTranscript(formattedTranscript);
+      setSourceLanguage(data.language || 'en');
+      setStatus('transcribed');
+      showNotification("Transcription completed successfully!");
+    } catch (err) {
+      console.error("Transcription error:", err);
+      const errorMessage = err.message.includes("Failed to fetch") 
+        ? "Cannot connect to the server. Please ensure the backend server is running."
+        : err.message;
+      setError(errorMessage);
+      setStatus('idle');
+    }
+  };
+
+  const summarize = async () => {
+    setStatus('summarizing');
+    setSummary('');
+    setError(null);
+    setTranslatedSummary('');
+
+    const isServerUp = await checkServerStatus();
+    if (!isServerUp) {
+      setError("Cannot connect to the backend server. Please ensure it's running and try again.");
+      setStatus('transcribed');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/summarize`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transcript: transcript,
+          style: summaryStyle,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Server error: ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      setSummary(data.summary);
+      setStatus('summarized');
+    } catch (err) {
+      console.error("Summarization error:", err);
+      setError("Failed to generate summary. Please try again.");
+      setStatus('transcribed');
+    }
+  };
+  
+  const translateSummary = async () => {
+    setStatus('translating');
+    setError(null);
+
+    const isServerUp = await checkServerStatus();
+    if (!isServerUp) {
+      setError("Cannot connect to the backend server. Please ensure it's running and try again.");
+      setStatus('summarized');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/translate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: summary,
+          source_language: sourceLanguage,
+          target_language: "English"
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Server error: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      setTranslatedSummary(data.translated_text);
+      setStatus('summarized');
+      showNotification('Translation successful!');
+    } catch (err) {
+      console.error("Translation error:", err);
+      setError("Failed to translate summary. Please try again.");
+      setStatus('summarized');
+    }
+  };
+
+
+  // --- EVENT HANDLERS ---
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      // Check file type and size
+      const validTypes = ['audio/wav', 'audio/mp3', 'audio/mpeg', 'audio/ogg', 'audio/webm', 'audio/m4a'];
+      if (!validTypes.includes(file.type) && !file.name.match(/\.(wav|mp3|m4a|ogg|webm)$/i)) {
+        setError("Invalid file format. Please upload a common audio file (e.g., WAV, MP3, M4A).");
+        return;
+      }
+      
+      // 100MB size limit
+      if (file.size > 100 * 1024 * 1024) {
+        setError("File is too large. Please upload an audio file smaller than 100MB.");
+        return;
+      }
+
+      setFileName(file.name);
+      transcribeAndDiarize(file);
+      showNotification('File uploaded! Processing...');
+    }
+  };
+
+  const handleStartRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStatus('recording');
+      // Use 'audio/wav' or 'audio/webm' which are typically well-supported
+      mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'audio/webm' }); 
+      audioChunksRef.current = [];
+      
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        audioChunksRef.current.push(event.data);
+      };
+      
+      mediaRecorderRef.current.onstop = () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        setFileName('live_recording.webm');
+        transcribeAndDiarize(audioBlob);
+        stream.getTracks().forEach(track => track.stop());
+      };
+      
+      mediaRecorderRef.current.start();
+      showNotification('Recording started!');
+    } catch (err) {
+      setError("Microphone access was denied. Please allow microphone access in your browser settings.");
+      console.error("Mic access error:", err);
+    }
+  };
+
+  const handleStopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+      showNotification('Recording stopped. Analyzing audio...');
+    }
+  };
+
+  const handleSummarize = () => {
+    summarize();
+  };
+  
+  const handleTranslate = () => {
+    translateSummary();
+  }
+
+  const handleCopyToClipboard = () => {
+    const textToCopy = `TRANSCRIPT:\n\n${transcript.map(t => 
+      `[${t.time}] ${t.speaker}: ${t.text}`
+    ).join('\n')}\n\nSUMMARY (${summaryStyle}):\n\n${translatedSummary || summary}`;
+    
+    // Fallback to execCommand for clipboard API compatibility in iframe environment
+    const textarea = document.createElement('textarea');
+    textarea.value = textToCopy;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+    setIsCopied(true);
+    showNotification('Results copied to clipboard!');
+    setTimeout(() => setIsCopied(false), 2000);
+  };
+
+  const handleReset = () => {
+    setStatus('idle');
+    setFileName('');
+    setTranscript([]);
+    setSummary('');
+    setTranslatedSummary('');
+    setSummaryStyle('professional');
+    setError(null);
+  };
+
+  // --- UI COMPONENTS ---
+
+  const Popup = () => (
+    <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 transition-all duration-500 transform ${showPopup ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0'}`}>
+      <div className="bg-gray-800 text-white py-3 px-6 rounded-full shadow-lg border border-gray-700 flex items-center gap-2 animate-pulse-once">
+        <Check className="h-5 w-5 text-green-400" />
+        <span className="text-sm font-medium">{popupMessage}</span>
+      </div>
+    </div>
+  );
+
+  const WelcomeScreen = () => (
+    <div className="text-center animate-fadeIn">
+      <BrainCircuit className="mx-auto h-20 w-20 text-blue-400 mb-4 animate-bounce-slow" />
+      <h1 className="text-4xl md:text-5xl font-extrabold text-white mb-2 tracking-tight drop-shadow-lg">Automatic Meeting Notes</h1>
+      <p className="text-lg text-gray-400 mb-8">Upload an audio file or record a new meeting to get started.</p>
+      <div className="flex flex-col md:flex-row gap-4 justify-center">
+        <label htmlFor="file-upload" className="w-full md:w-auto cursor-pointer bg-gray-700 hover:bg-gray-600 text-white font-bold py-3 px-6 rounded-xl flex items-center justify-center transition-all duration-300 transform hover:scale-105 shadow-xl">
+          <Upload className="mr-2 h-5 w-5" />
+          Upload Audio File
+        </label>
+        <input id="file-upload" type="file" className="hidden" onChange={handleFileChange} accept="audio/*" />
+        <button onClick={handleStartRecording} className="w-full md:w-auto bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-6 rounded-xl flex items-center justify-center transition-all duration-300 transform hover:scale-105 shadow-xl">
+          <Mic className="mr-2 h-5 w-5" />
+          Record Live
+        </button>
+      </div>
+        {error && <p className="text-red-400 mt-4 bg-red-900/20 rounded-lg p-3 border border-red-800 animate-fadeIn">{error}</p>}
+    </div>
+  );
+
+  const RecordingScreen = () => (
+      <div className="text-center flex flex-col items-center animate-fadeIn">
+        <h2 className="text-3xl font-bold text-white mb-4">Recording in Progress...</h2>
+        <p className="text-gray-400 mb-8">Click the button below to stop.</p>
+        <div className="relative h-28 w-28 mb-8">
+            <div className="absolute inset-0 bg-red-500 rounded-full animate-pulse-fast opacity-50"></div>
+            <div className="relative flex items-center justify-center h-28 w-28 bg-red-600 rounded-full shadow-lg">
+                <Mic className="h-12 w-12 text-white" />
+            </div>
+        </div>
+        <button onClick={handleStopRecording} className="mt-8 bg-red-600 hover:bg-red-500 text-white font-bold py-3 px-6 rounded-xl flex items-center transition-all duration-300 transform hover:scale-105 shadow-xl">
+          <StopCircle className="mr-2 h-5 w-5" />
+          Stop Recording
+        </button>
+    </div>
+  );
+  
+  const ProcessingScreen = () => (
+    <div className="text-center flex flex-col items-center animate-fadeIn">
+      <h2 className="text-3xl font-bold text-white mb-4">
+        {status === 'processing' ? 'Analyzing Audio...' : status === 'summarizing' ? 'Generating Summary...' : 'Translating...'}
+      </h2>
+      <p className="text-gray-400 mb-8">
+        This might take a moment. Our AI is hard at work!
+      </p>
+      <div className="w-20 h-20 border-8 border-t-8 border-t-blue-500 border-gray-700 rounded-full animate-spin"></div>
+       <p className="text-gray-500 mt-8 italic">{fileName}</p>
+    </div>
+  );
+
+  const ResultsScreen = () => (
+    <div className="w-full animate-fadeIn">
+        <div className="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
+            <h2 className="text-3xl md:text-4xl font-extrabold text-white flex items-center drop-shadow-lg">
+                <FileText className="mr-3 text-blue-400" />
+                Analysis Results
+            </h2>
+            <button onClick={handleReset} className="bg-gray-700 hover:bg-gray-600 text-white font-semibold py-2 px-4 rounded-xl flex items-center transition-all duration-300 text-sm transform hover:scale-105 shadow-md">
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Start Over
+            </button>
+        </div>
+        
+        {error && (
+            <div className="flex items-center gap-2 p-4 mb-6 text-red-400 bg-red-900/20 rounded-lg border border-red-800">
+                <XCircle className="h-5 w-5" />
+                <p>{error}</p>
+            </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Transcript Section */}
+            <div className="bg-gray-800/50 p-6 rounded-2xl border border-gray-700/50 shadow-inner overflow-hidden transform transition-all hover:scale-[1.01] duration-300">
+                <h3 className="text-2xl font-bold text-white mb-4 flex items-center">Transcript <FileText className="ml-2 h-5 w-5 text-blue-400"/></h3>
+                <div className="h-96 overflow-y-auto pr-2 space-y-4 text-gray-300 text-sm custom-scrollbar">
+                    {transcript.map((item, index) => (
+                        <div key={index} className="flex gap-3">
+                            <div className={`flex-shrink-0 h-10 w-10 rounded-full flex items-center justify-center font-bold text-white ${item.speaker === 'Speaker' ? 'bg-blue-600/70' : 'bg-purple-600/70'}`}>
+                                {item.speaker.charAt(item.speaker.length-1)}
+                            </div>
+                            <div className="w-full">
+                                <div className="flex items-baseline gap-2">
+                                    <p className="font-bold text-white text-base">{item.speaker}</p>
+                                    <p className="text-xs text-gray-400">{item.time}</p>
+                                </div>
+                                <p className="mt-1 leading-relaxed">{item.text}</p>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            {/* Summary Section */}
+            <div className="bg-gray-800/50 p-6 rounded-2xl border border-gray-700/50 shadow-inner flex flex-col overflow-hidden transform transition-all hover:scale-[1.01] duration-300">
+                <h3 className="text-2xl font-bold text-white mb-4 flex items-center">Summary <BrainCircuit className="ml-2 h-5 w-5 text-purple-400"/></h3>
+                
+                <div className="flex flex-wrap items-center gap-2 mb-4 bg-gray-900/50 p-1 rounded-xl shadow-lg">
+                    <button onClick={() => setSummaryStyle('short')} className={`flex-1 py-2 px-3 rounded-lg text-sm font-semibold transition-all ${summaryStyle === 'short' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-300 hover:bg-gray-700/50'}`}><MessageSquare className="inline mr-1 h-4 w-4" />Short</button>
+                    <button onClick={() => setSummaryStyle('long')} className={`flex-1 py-2 px-3 rounded-lg text-sm font-semibold transition-all ${summaryStyle === 'long' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-300 hover:bg-gray-700/50'}`}><MessageSquare className="inline mr-1 h-4 w-4" />Long</button>
+                    <button onClick={() => setSummaryStyle('professional')} className={`flex-1 py-2 px-3 rounded-lg text-sm font-semibold transition-all ${summaryStyle === 'professional' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-300 hover:bg-gray-700/50'}`}><MessageSquare className="inline mr-1 h-4 w-4" />Professional</button>
+                    <button onClick={() => setSummaryStyle('bullet_points')} className={`flex-1 py-2 px-3 rounded-lg text-sm font-semibold transition-all ${summaryStyle === 'bullet_points' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-300 hover:bg-gray-700/50'}`}><List className="inline mr-1 h-4 w-4"/>Bullet Points</button>
+                    <button onClick={() => setSummaryStyle('report')} className={`flex-1 py-2 px-3 rounded-lg text-sm font-semibold transition-all ${summaryStyle === 'report' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-300 hover:bg-gray-700/50'}`}><Gavel className="inline mr-1 h-4 w-4"/>Report</button>
+                </div>
+                
+                {summary && sourceLanguage !== 'en' && !translatedSummary && (
+                    <button onClick={handleTranslate} className="mt-4 mb-4 bg-purple-600 hover:bg-purple-500 text-white font-semibold py-2 px-4 rounded-xl flex items-center justify-center transition-all duration-300 transform hover:scale-105 shadow-lg">
+                        <Languages className="mr-2 h-4 w-4"/>Translate to English
+                    </button>
+                )}
+
+                {status === 'transcribed' && (
+                  <div className="flex-grow flex flex-col items-center justify-center text-center">
+                    <p className="text-gray-400 mb-4 animate-pulse">Select a summary style and click below to generate.</p>
+                    <button onClick={handleSummarize} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-6 rounded-xl transform hover:scale-105 transition-all duration-300 shadow-lg">Generate Summary</button>
+                  </div>
+                )}
+
+                {status === 'summarizing' && (
+                    <div className="flex-grow flex items-center justify-center">
+                        <div className="w-16 h-16 border-8 border-t-8 border-t-purple-500 border-gray-700 rounded-full animate-spin"></div>
+                    </div>
+                )}
+                
+                {status === 'summarized' && (
+                    <div className="flex-grow flex flex-col">
+                        <div className="h-72 overflow-y-auto pr-2 text-gray-300 whitespace-pre-wrap leading-relaxed custom-scrollbar">
+                            <p className="text-white font-semibold text-lg mb-2">Original Summary:</p>
+                            <p className="mb-4">{summary}</p>
+                            {translatedSummary && (
+                                <>
+                                <p className="text-blue-400 font-semibold text-lg mt-4 mb-2">English Translation:</p>
+                                <p>{translatedSummary}</p>
+                                </>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-4 mt-auto pt-4 border-t border-gray-700/50">
+                            <button onClick={handleSummarize} className="w-full bg-gray-700 hover:bg-gray-600 text-white font-semibold py-2 px-4 rounded-xl flex items-center justify-center transition-all duration-300 text-sm shadow-md">
+                                <RefreshCw className="mr-2 h-4 w-4" />
+                                Regenerate
+                            </button>
+                            <button onClick={handleCopyToClipboard} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2 px-4 rounded-xl flex items-center justify-center transition-all duration-300 text-sm shadow-lg">
+                              {isCopied ? <Check className="mr-2 h-4 w-4" /> : <Copy className="mr-2 h-4 w-4" />}
+                              {isCopied ? 'Copied!' : 'Copy All'}
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    </div>
+  );
+
+
+  // Main Render Logic
+  return (
+    <div className="bg-gray-950 min-h-screen text-white font-sans flex flex-col items-center justify-center p-4">
+      <style>{`
+        /* Custom scrollbar for transcript/summary overflow */
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(31, 41, 55, 0.5); /* gray-800/50 */
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(59, 130, 246, 0.7); /* blue-500/70 */
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: rgb(59, 130, 246); /* blue-500 */
+        }
+        /* Tailwind animations for better visual feedback */
+        @keyframes pulse-fast {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
+        }
+        .animate-pulse-fast {
+            animation: pulse-fast 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes bounce-slow {
+            0%, 100% { transform: translateY(-5%); animation-timing-function: cubic-bezier(0.8, 0, 1, 1); }
+            50% { transform: translateY(0); animation-timing-function: cubic-bezier(0, 0, 0.2, 1); }
+        }
+        .animate-bounce-slow {
+            animation: bounce-slow 3s infinite;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .animate-fadeIn {
+            animation: fadeIn 0.5s ease-out;
+        }
+      `}</style>
+      <div className="w-full max-w-6xl mx-auto bg-black bg-opacity-30 backdrop-blur-xl rounded-3xl shadow-[0_0_50px_rgba(37,99,235,0.2)] p-8 md:p-12 border border-gray-700/50">
+        <main className="flex items-center justify-center" style={{ minHeight: '60vh' }}>
+          {status === 'idle' && <WelcomeScreen />}
+          {status === 'recording' && <RecordingScreen />}
+          {(status === 'processing' || status === 'summarizing' || status === 'translating') && <ProcessingScreen />}
+          {(status === 'transcribed' || status === 'summarized') && <ResultsScreen />}
+        </main>
+      </div>
+       <footer className="text-center text-gray-500 mt-6 text-sm">
+           <p className="animate-fadeIn">Powered by Advanced AI Models for Transcription and Summarization.</p>
+       </footer>
+       <Popup />
+    </div>
+  );
+}
