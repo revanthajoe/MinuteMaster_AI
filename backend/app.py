@@ -46,7 +46,7 @@ def _can_create_symlink():
         except Exception:
             pass
 
-# --- Robust Cache and Environment Setup (MUST run before importing HF-related libs) ---
+# --- Robust Cache and Environment Setup ---
 # Define the project's root directory to store models locally
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')
@@ -82,6 +82,15 @@ else:
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['HF_HUB_OFFLINE'] = '0'
+
+# Set network timeouts
+os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '30')
+os.environ.setdefault('HF_HUB_READ_TIMEOUT', '60')
+os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '300'
+
+# Configure socket timeout globally
+import socket
+socket.setdefaulttimeout(60)
 
 # Suppress warnings
 import warnings
@@ -159,7 +168,7 @@ def clean_problematic_cache():
         logger.warning(f"Cache cleaning failed (non-fatal): {e}")
 
 
-# --- CONFIGURE FFmpeg/AudioSegment (Unchanged) ---
+# --- CONFIGURE FFmpeg/AudioSegment ---
 FFMPEG_PATH = r"C:\ffmpeg-master-latest-win64-gpl-shared\bin"
 FFMPEG_EXE = os.path.join(FFMPEG_PATH, 'ffmpeg.exe')
 FFPROBE_EXE = os.path.join(FFMPEG_PATH, 'ffprobe.exe')
@@ -183,26 +192,26 @@ except Exception as e:
     print(f"ERROR: FFmpeg configuration failed: {str(e)}", file=sys.stderr)
     sys.exit(1)
 
-# --- Configuration for Low-End Efficiency (Unchanged) ---
+# --- Configuration for Low-End Efficiency ---
 WHISPER_MODEL_SIZE = "base.en"
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 START_TIME = time.time()
 
-# --- Flask App and Database Initialization (Unchanged) ---
+# --- Flask App and Database Initialization ---
 app = Flask(__name__)
 CORS(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(SCRIPT_DIR, 'transcriptions.db')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- Database Model (Unchanged) ---
+# --- Database Model (Modified: Translation removed) ---
 class TranscriptionJob(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     filename = db.Column(db.String(200), nullable=False)
     transcript = db.Column(db.Text, nullable=True)
     summary = db.Column(db.Text, nullable=True)
-    translated_text = db.Column(db.Text, nullable=True)
+    # Translation column removed
     language = db.Column(db.String(10), nullable=True)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
@@ -213,14 +222,63 @@ class TranscriptionJob(db.Model):
             'language': self.language,
             'transcript': self.transcript,
             'summary': self.summary,
-            'translated_text': self.translated_text,
             'created_at': self.created_at.isoformat()
         }
 
 # --- Model Loading ---
 WHISPER_MODEL = None
 DIARIZER_MODEL = None
-TRANSLATORS = {}
+
+def timeout_handler(signum, frame):
+    """Timeout handler for download operations."""
+    raise TimeoutError("Download operation timed out. Check your internet connection.")
+
+def download_with_timeout(repo_id, local_dir, timeout_seconds=300, offline_fallback=True, **kwargs):
+    """Wrapper for snapshot_download with timeout protection and offline fallback."""
+    from huggingface_hub import snapshot_download
+    import signal
+    
+    logger.info(f"Downloading {repo_id} with {timeout_seconds}s timeout...")
+    
+    if os.path.exists(local_dir) and len(os.listdir(local_dir)) > 0:
+        logger.info(f"✓ {repo_id} already exists locally at {local_dir}. Skipping download.")
+        return local_dir
+    
+    old_handler = None
+    if platform.system() != 'Windows':
+        try:
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout_seconds)
+        except (AttributeError, ValueError):
+            pass
+    
+    try:
+        return snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            **kwargs
+        )
+    except TimeoutError as e:
+        logger.error(f"Download timeout for {repo_id}: {e}")
+        if offline_fallback and os.path.exists(local_dir):
+            logger.warning(f"Attempting offline fallback for {repo_id}...")
+            if len(os.listdir(local_dir)) > 0:
+                logger.info(f"Using partially downloaded files from {local_dir}")
+                return local_dir
+        raise
+    except Exception as e:
+        logger.error(f"Download failed for {repo_id}: {e}")
+        if offline_fallback and os.path.exists(local_dir) and len(os.listdir(local_dir)) > 0:
+            logger.warning(f"Download failed but partial files exist. Using offline fallback...")
+            return local_dir
+        raise
+    finally:
+        if platform.system() != 'Windows' and old_handler is not None:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, ValueError):
+                pass
 
 def load_with_retries(load_func, model_name, max_attempts=3, delay=2):
     """Generic retry wrapper for model loading with Windows-specific error handling."""
@@ -232,14 +290,19 @@ def load_with_retries(load_func, model_name, max_attempts=3, delay=2):
             result = load_func()
             logger.info(f"✓ {model_name} loaded successfully.")
             return result
+        except TimeoutError as e:
+            last_exception = e
+            logger.warning(f"Timeout while loading {model_name} (attempt {attempt}): {e}")
+            logger.warning("This may indicate network connectivity issues or slow HuggingFace hub.")
+            if attempt < max_attempts:
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
         except OSError as e:
             last_exception = e
-            # Handle Windows symlink privilege error specifically
             if hasattr(e, 'winerror') and e.winerror == 1314:
                 if attempt == 1:
                     logger.warning("WinError 1314 (no symlink privilege). Switching to copy-only fallback.")
                 
-                # Attempt automatic cache cleaning on first symlink error
                 if attempt == 1 and platform.system() == "Windows":
                     logger.info("Attempting automatic cache cleanup...")
                     clean_problematic_cache()
@@ -256,19 +319,13 @@ def load_with_retries(load_func, model_name, max_attempts=3, delay=2):
                 logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
     
-    # All attempts failed
     logger.error(f"FATAL: {model_name} failed after {max_attempts} attempts.")
     
-    # Provide Windows-specific guidance
     if (platform.system() == "Windows" and 
         isinstance(last_exception, OSError) and 
         hasattr(last_exception, 'winerror') and 
         last_exception.winerror == 1314):
-        logger.error("Windows symlink privilege error detected. Try one of these solutions:")
-        logger.error("1. Run the application as Administrator")
-        logger.error("2. Enable Developer Mode in Windows Settings")
-        logger.error("3. Clear the HuggingFace cache directory and restart")
-        logger.error(f"   Cache location: {os.path.join(MODEL_DIR, 'huggingface')}")
+        logger.error("Windows symlink privilege error detected.")
     
     raise last_exception
 
@@ -284,19 +341,16 @@ def load_whisper_model():
 
 def load_diarizer_model():
     """Load Diarizer model with Windows symlink workaround."""
-    # Import here to ensure environment variables are set
     from huggingface_hub import snapshot_download
     from speechbrain.inference.classifiers import EncoderClassifier
     import logging as _logging
 
-    # Quiet third-party libraries
     for noisy in ["speechbrain", "huggingface_hub", "transformers"]:
         try:
             _logging.getLogger(noisy).setLevel(_logging.WARNING)
         except Exception:
             pass
     
-    # On Windows force-disable symlinks by monkeypatching if still attempted
     if platform.system() == "Windows":
         try:
             import types as _types
@@ -306,12 +360,10 @@ def load_diarizer_model():
                         if not os.path.exists(dst):
                             shutil.copytree(src, dst)
                     else:
-                        # ensure parent dir
                         os.makedirs(os.path.dirname(dst), exist_ok=True)
                         if not os.path.exists(dst):
                             shutil.copy2(src, dst)
                 except Exception as copy_e:  # noqa: F841
-                    # Silently ignore to avoid noise
                     pass
             if getattr(os, 'symlink', None):
                 os.symlink = _safe_symlink  # type: ignore
@@ -323,17 +375,16 @@ def load_diarizer_model():
 
     logger.info("Pre-caching speechbrain speaker recognition model (copy-only mode)...")
     
-    # Download model files without symlinks
-    snapshot_download(
+    download_with_timeout(
         repo_id="speechbrain/spkrec-xvect-voxceleb",
         local_dir=spkrec_dir,
         local_dir_use_symlinks=False,
         cache_dir=os.path.join(MODEL_DIR, 'huggingface'),
         repo_type='model',
-        force_download=False
+        force_download=False,
+        timeout_seconds=300
     )
 
-    # Additional Windows workaround: copy files from user cache if they exist
     if platform.system() == "Windows":
         try:
             user_hub_snapshots = os.path.join(
@@ -368,7 +419,6 @@ def load_diarizer_model():
         except Exception as e:
             logger.debug(f"Windows workaround failed (non-fatal): {e}")
 
-    # Load the classifier from the local directory
     EncoderClassifier.from_hparams(
         source=spkrec_dir,
         savedir=spkrec_dir,
@@ -376,17 +426,15 @@ def load_diarizer_model():
     )
     logger.info("✓ Speechbrain model cached.")
     
-    # Initialize the diarizer safely (handle versions without 'device' kw)
     diarizer_instance = None
     try:
         init_sig = inspect.signature(Diarizer.__init__)
         if 'device' in init_sig.parameters:
             diarizer_instance = Diarizer(device=DEVICE)
         else:
-            diarizer_instance = Diarizer()  # device not supported in this version
+            diarizer_instance = Diarizer()
         logger.info("✓ Diarizer model instantiated.")
     except TypeError as te:
-        # Retry once without device if first attempt failed due to unexpected kw
         if 'unexpected keyword argument' in str(te) and diarizer_instance is None:
             try:
                 diarizer_instance = Diarizer()
@@ -396,11 +444,9 @@ def load_diarizer_model():
         else:
             raise te
     except Exception as e:
-        # Final fallback: provide a no-op diarizer so app can still run
         logger.warning(f"Falling back to SimpleFallbackDiarizer due to error: {e}")
         class SimpleFallbackDiarizer:
             def diarize(self, wav_path):
-                # Single speaker fallback covering entire audio duration (approx using pydub length)
                 try:
                     from pydub import AudioSegment as _AS
                     ms = len(_AS.from_file(wav_path))
@@ -417,20 +463,14 @@ def load_models():
     global WHISPER_MODEL, DIARIZER_MODEL
     
     try:
-        # Load Whisper model
         WHISPER_MODEL = load_with_retries(load_whisper_model, "Whisper model")
-        
-        # Load Diarizer model  
         DIARIZER_MODEL = load_with_retries(load_diarizer_model, "Diarizer model")
-        
         return True
-        
     except Exception as e:
         logger.error(f"Failed to load required models: {e}")
         return False
 
-# --- Helper Functions and API Endpoints (Unchanged) ---
-# ... (The rest of your code from 'def simple_sentence_tokenize(text):' onwards is correct and remains the same)
+# --- Helper Functions and API Endpoints ---
 
 def simple_sentence_tokenize(text):
     endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
@@ -447,17 +487,14 @@ def summarize_text_extractive(text, style="professional"):
     
     from heapq import nlargest
     
-    # Configuration for different styles
-    # ratio: percentage of sentences to keep
-    # min_sent: minimum number of sentences
     style_config = {
         'short':        {'ratio': 0.15, 'min_sent': 1},
         'professional': {'ratio': 0.25, 'min_sent': 2},
         'long':         {'ratio': 0.40, 'min_sent': 5},
         'bullet_points':{'ratio': 0.20, 'min_sent': 3},
-        'report':       {'ratio': 0.50, 'min_sent': 5}, # Detailed
-        'abstract':     {'ratio': 0.10, 'min_sent': 1}, # Very concise
-        'action_items': {'ratio': 0.15, 'min_sent': 2}  # Concise
+        'report':       {'ratio': 0.50, 'min_sent': 5},
+        'abstract':     {'ratio': 0.10, 'min_sent': 1},
+        'action_items': {'ratio': 0.15, 'min_sent': 2}
     }
     
     config = style_config.get(style.lower(), style_config['professional'])
@@ -467,22 +504,19 @@ def summarize_text_extractive(text, style="professional"):
     words = [word for word in text.lower().split() if word.isalnum()]
     word_frequencies = {word: words.count(word) for word in set(words)}
     
-    # Score sentences based on word frequency
     sentence_scores = {}
     for sentence in sentences:
         for word in sentence.lower().split():
             if word in word_frequencies:
-                if len(sentence.split()) < 30: # Ignore very long sentences
+                if len(sentence.split()) < 30:
                     if sentence not in sentence_scores: sentence_scores[sentence] = 0
                     sentence_scores[sentence] += word_frequencies[word]
         if sentence in sentence_scores:
             sentence_scores[sentence] = sentence_scores[sentence] / (len(sentence.split()) + 1)
 
-    # Select top sentences
     select_length = max(config['min_sent'], int(len(sentences) * ratio))
     summary_sentences = nlargest(select_length, sentence_scores, key=sentence_scores.get)
     
-    # Formatting
     if style.lower() == "bullet_points" or style.lower() == "action_items":
         summary = "\n• " + "\n• ".join(summary_sentences)
     elif style.lower() == "report":
@@ -501,11 +535,11 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "uptime": int(time.time() - START_TIME),
-        "models_loaded": { "whisper": WHISPER_MODEL is not None, "diarization": DIARIZER_MODEL is not None, "summarizer": True, "translator_cache_size": len(TRANSLATORS) }
+        "models_loaded": { "whisper": WHISPER_MODEL is not None, "diarization": DIARIZER_MODEL is not None, "summarizer": True }
     })
 
 @app.route('/deps', methods=['GET'])
-def deps_check():  # Lightweight dependency visibility
+def deps_check():
     return jsonify({
         "missing": missing_deps,
         "python": sys.version,
@@ -586,7 +620,6 @@ def summarize_text_api():
     text = data['text']
     style = data.get('style', 'professional')
     
-    # Map frontend style names to backend configuration keys
     style_mapping = {
         'bullets': 'bullet_points',
         'professional': 'professional',
@@ -606,75 +639,6 @@ def summarize_text_api():
             db.session.commit()
             return jsonify({"summary": summary, "message": f"Summary saved to job {job.id}"})
     return jsonify({"summary": summary})
-
-# --- REPLACEMENT FUNCTION FOR app.py ---
-
-@app.route('/translate', methods=['POST'])
-def translate_text_api():
-    data = request.get_json()
-    if not data or 'text' not in data or 'target_language' not in data:
-        return jsonify({"error": "Missing text or target_language"}), 400
-    
-    # Standardize inputs
-    target_code = data['target_language']
-    
-    # NLLB requires specific language codes (e.g., 'tam_Tam' instead of 'ta')
-    # We map your frontend simple codes to NLLB complex codes
-    NLLB_CODE_MAP = {
-        "ta": "tam_Tam",  # Tamil
-        "hi": "hin_Deva", # Hindi
-        "fr": "fra_Latn", # French
-        "es": "spa_Latn", # Spanish
-        "de": "deu_Latn", # German
-        "en": "eng_Latn"  # English
-    }
-    
-    # Get the correct target code, default to English if unknown
-    forced_bos_token = NLLB_CODE_MAP.get(target_code, "eng_Latn")
-    
-    model_key = "facebook/nllb-200-distilled-600M"
-    
-    try:
-        # Load the universal model if not already loaded
-        if model_key not in TRANSLATORS:
-            print(f"--- Loading Universal Translation Model ({model_key})... ---")
-            print("This is a 1GB download but only needs to happen ONCE for all languages.")
-            
-            # We use the specific NLLB pipeline
-            TRANSLATORS[model_key] = pipeline(
-                "translation", 
-                model=model_key, 
-                device=DEVICE,
-                src_lang="eng_Latn" # Assuming source is always English for now
-            )
-            print(f"✓ Universal Translator loaded.")
-            
-        translator = TRANSLATORS[model_key]
-        
-        # NLLB requires specifying the target language token
-        translated_result = translator(
-            data['text'], 
-            max_length=512, 
-            forced_bos_token_id=translator.tokenizer.lang_code_to_id[forced_bos_token]
-        )
-        
-        translated_text = translated_result[0]['translation_text']
-        
-        # Save to DB if job_id exists
-        if 'job_id' in data and data['job_id']:
-            job = TranscriptionJob.query.get(data['job_id'])
-            if job:
-                job.translated_text = translated_text
-                db.session.commit()
-                
-        return jsonify({"translated_text": translated_text})
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"Error during translation: {str(e)}", file=sys.stderr)
-        return jsonify({"error": f"Translation failed: {str(e)}"}), 500
-    
 
 @app.route('/history', methods=['GET'])
 def get_history():

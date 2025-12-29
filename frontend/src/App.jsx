@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { 
   Upload, Mic, StopCircle, FileText, BrainCircuit, 
   MessageSquare, List, Check, RefreshCw, 
-  Clock, Download, Languages, Search, ChevronRight, FileBarChart, Zap, AlignLeft
+  Clock, Download, Search, ChevronRight, FileBarChart, Zap, AlignLeft
 } from 'lucide-react';
 
 // --- Configuration ---
@@ -22,8 +22,6 @@ export default function App() {
   
   // UI State
   const [summaryStyle, setSummaryStyle] = useState('professional');
-  const [targetLang, setTargetLang] = useState('fr'); 
-  const [translatedText, setTranslatedText] = useState('');
   const [error, setError] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
 
@@ -33,24 +31,17 @@ export default function App() {
 
   // --- HELPER: Dynamic Speaker Colors ---
   const getSpeakerColor = (speakerName) => {
-    // Generate a consistent color from the speaker string
     if (!speakerName) return 'bg-gray-500';
-    
-    // Simple hash function
     let hash = 0;
     for (let i = 0; i < speakerName.length; i++) {
         hash = speakerName.charCodeAt(i) + ((hash << 5) - hash);
     }
-    
     const colors = [
         'bg-blue-600', 'bg-purple-600', 'bg-green-600', 
         'bg-yellow-600', 'bg-red-600', 'bg-indigo-600', 
         'bg-pink-600', 'bg-teal-600', 'bg-orange-600'
     ];
-    
-    // Pick color based on hash
-    const index = Math.abs(hash) % colors.length;
-    return colors[index];
+    return colors[Math.abs(hash) % colors.length];
   };
 
   // --- API FUNCTIONS ---
@@ -75,7 +66,6 @@ export default function App() {
     setFileName(job.filename);
     setCurrentJobId(job.id);
     setSummary(job.summary || '');
-    setTranslatedText(job.translated_text || '');
     
     if (typeof job.transcript === 'string') {
         const lines = job.transcript.split('\n');
@@ -97,7 +87,7 @@ export default function App() {
     setView('home');
   };
 
-  const transcribeAndDiarize = async (audioBlob) => {
+  const transcribeAndDiarize = async (audioBlob, explicitFileName) => {
     setStatus('processing');
     setError(null);
     setTranscript([]);
@@ -105,7 +95,8 @@ export default function App() {
     setCurrentJobId(null);
 
     const formData = new FormData();
-    formData.append('audio', audioBlob, fileName || 'live_recording.wav');
+    const nameToSend = explicitFileName || fileName || 'live_recording.wav';
+    formData.append('audio', audioBlob, nameToSend);
 
     try {
       const response = await fetch(`${BACKEND_URL}/transcribe`, { method: 'POST', body: formData });
@@ -124,11 +115,8 @@ export default function App() {
     }
   };
 
-  // Triggered manually or when style changes
   const summarize = async (overrideStyle = null) => {
     const styleToUse = overrideStyle || summaryStyle;
-    
-    // If we already have a summary and just changed style, show loading
     if (summary) setStatus('summarizing'); 
     else setStatus('summarizing');
 
@@ -159,45 +147,14 @@ export default function App() {
 
   const handleStyleChange = (newStyle) => {
       setSummaryStyle(newStyle);
-      // AUTO REGENERATE: If we already have a summary or transcript, generate immediately
       if (status === 'transcribed' || status === 'summarized') {
           summarize(newStyle);
       }
   };
 
-  const translate = async () => {
-      if (!summary && !transcript.length) return;
-      
-      // Temporary loading indicator
-      const originalText = translatedText;
-      setTranslatedText("Translating..."); 
-      
-      const textToTranslate = summary || transcript.map(t => t.text).join(' ');
-      
-      try {
-          const response = await fetch(`${BACKEND_URL}/translate`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                  text: textToTranslate,
-                  source_language: 'en',
-                  target_language: targetLang,
-                  job_id: currentJobId
-              })
-          });
-          
-          if (!response.ok) throw new Error("Translation failed");
-          const data = await response.json();
-          setTranslatedText(data.translated_text);
-      } catch (err) {
-          setTranslatedText(originalText); // Revert
-          setError("Translation failed. Check backend console for supported models.");
-      }
-  };
-
   const handleDownload = () => {
       const element = document.createElement("a");
-      const content = `TRANSCRIPT:\n\n${transcript.map(t => `[${t.time}] ${t.speaker}: ${t.text}`).join('\n')}\n\nSUMMARY (${summaryStyle}):\n${summary}\n\nTRANSLATION (${targetLang}):\n${translatedText}`;
+      const content = `TRANSCRIPT:\n\n${transcript.map(t => `[${t.time}] ${t.speaker}: ${t.text}`).join('\n')}\n\nSUMMARY (${summaryStyle}):\n${summary}`;
       const file = new Blob([content], {type: 'text/plain'});
       element.href = URL.createObjectURL(file);
       element.download = `${fileName || 'meeting'}_notes.txt`;
@@ -210,7 +167,7 @@ export default function App() {
     const file = e.target.files[0];
     if (file) {
       setFileName(file.name);
-      transcribeAndDiarize(file);
+      transcribeAndDiarize(file, file.name);
     }
   };
 
@@ -223,8 +180,9 @@ export default function App() {
       mediaRecorderRef.current.ondataavailable = (e) => audioChunksRef.current.push(e.data);
       mediaRecorderRef.current.onstop = () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        setFileName('live_recording.wav');
-        transcribeAndDiarize(audioBlob);
+        const liveName = 'live_recording.wav';
+        setFileName(liveName);
+        transcribeAndDiarize(audioBlob, liveName);
         stream.getTracks().forEach(track => track.stop());
       };
       mediaRecorderRef.current.start();
@@ -239,9 +197,14 @@ export default function App() {
 
   // --- RENDER HELPERS ---
   const HistoryScreen = () => {
-      const filteredHistory = history.filter(h => 
-          h.filename.toLowerCase().includes(searchTerm.toLowerCase())
-      );
+      // UPDATED SEARCH LOGIC: Searches Filename, Summary, AND Transcript
+      const filteredHistory = history.filter(h => {
+          const lowerTerm = searchTerm.toLowerCase();
+          const matchFilename = h.filename.toLowerCase().includes(lowerTerm);
+          const matchSummary = h.summary && h.summary.toLowerCase().includes(lowerTerm);
+          const matchTranscript = h.transcript && h.transcript.toLowerCase().includes(lowerTerm);
+          return matchFilename || matchSummary || matchTranscript;
+      });
 
       return (
         <div className="w-full">
@@ -249,13 +212,13 @@ export default function App() {
                 <h2 className="text-3xl font-bold text-white flex items-center">
                     <Clock className="mr-3 text-blue-400" /> Meeting History
                 </h2>
-                <div className="relative">
+                <div className="relative w-64">
                     <input 
                         type="text" 
-                        placeholder="Search filenames..." 
+                        placeholder="Search transcripts..." 
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
-                        className="bg-gray-800 text-white pl-10 pr-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        className="w-full bg-gray-800 text-white pl-10 pr-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                     <Search className="absolute left-3 top-2.5 h-4 w-4 text-gray-400" />
                 </div>
@@ -272,7 +235,15 @@ export default function App() {
                     <tbody className="divide-y divide-gray-700">
                         {filteredHistory.map((job) => (
                             <tr key={job.id} className="hover:bg-gray-700/30 transition">
-                                <td className="p-4 text-white font-medium">{job.filename}</td>
+                                <td className="p-4 text-white font-medium">
+                                    {job.filename}
+                                    {/* Highlight if match was found in content but not filename */}
+                                    {searchTerm && !job.filename.toLowerCase().includes(searchTerm.toLowerCase()) && (
+                                        <span className="ml-2 text-xs bg-blue-900 text-blue-200 px-2 py-0.5 rounded-full">
+                                            Content Match
+                                        </span>
+                                    )}
+                                </td>
                                 <td className="p-4 text-gray-400 text-sm">{new Date(job.created_at).toLocaleDateString()}</td>
                                 <td className="p-4">
                                     <button onClick={() => loadJobFromHistory(job)} className="text-blue-400 hover:text-blue-300 flex items-center text-sm font-semibold">
@@ -281,6 +252,13 @@ export default function App() {
                                 </td>
                             </tr>
                         ))}
+                        {filteredHistory.length === 0 && (
+                            <tr>
+                                <td colSpan="3" className="p-8 text-center text-gray-500">
+                                    No meetings found matching "{searchTerm}"
+                                </td>
+                            </tr>
+                        )}
                     </tbody>
                 </table>
             </div>
@@ -338,7 +316,6 @@ export default function App() {
                 <div className="h-96 overflow-y-auto pr-2 space-y-4 scrollbar-thin scrollbar-thumb-gray-600">
                     {transcript.map((item, index) => (
                         <div key={index} className="flex gap-3">
-                            {/* DYNAMIC AVATAR COLOR */}
                             <div className={`flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center font-bold text-white text-xs ${getSpeakerColor(item.speaker)}`}>
                                 {item.speaker?.charAt(item.speaker.length-1) || 'S'}
                             </div>
@@ -386,33 +363,8 @@ export default function App() {
                   </div>
                 ) : (
                     <div className="flex-grow flex flex-col">
-                        <div className="h-64 overflow-y-auto pr-2 text-gray-300 text-sm whitespace-pre-wrap leading-relaxed mb-4 border-b border-gray-700 pb-4">
+                        <div className="h-full overflow-y-auto pr-2 text-gray-300 text-sm whitespace-pre-wrap leading-relaxed mb-4">
                           {summary}
-                        </div>
-                        
-                        {/* Translation */}
-                        <div className="mt-auto pt-2">
-                            <div className="flex items-center gap-2 mb-2">
-                                <Languages className="h-4 w-4 text-blue-400" />
-                                <span className="text-sm font-bold text-gray-300">Translate To:</span>
-                                <select 
-                                    value={targetLang} 
-                                    onChange={(e) => setTargetLang(e.target.value)}
-                                    className="bg-gray-900 text-white text-xs p-1 rounded border border-gray-700 focus:border-blue-500 outline-none"
-                                >
-                                    <option value="fr">French</option>
-                                    <option value="es">Spanish</option>
-                                    <option value="de">German</option>
-                                    <option value="hi">Hindi</option>
-                                    <option value="ta">Tamil</option>
-                                </select>
-                                <button onClick={translate} className="text-xs bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded">Translate</button>
-                            </div>
-                            {translatedText && (
-                                <div className="p-3 bg-gray-900/50 rounded-lg text-sm text-gray-300 italic h-24 overflow-y-auto">
-                                    {translatedText}
-                                </div>
-                            )}
                         </div>
                     </div>
                 )}
