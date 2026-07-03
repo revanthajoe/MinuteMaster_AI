@@ -53,3 +53,11 @@ backend/temp_audio/
 # Environment
 .env
 .env.local
+
+# FFmpeg and large files
+ffmpeg-master-latest-win64-gpl-shared/
+ffmpeg-master-latest-win64-gpl-shared.zip
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+DS/*.zip
