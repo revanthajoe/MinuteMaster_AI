@@ -419,6 +419,27 @@ def load_diarizer_model():
         except Exception as e:
             logger.debug(f"Windows workaround failed (non-fatal): {e}")
 
+    # Some YAML loader implementations (or version mismatches between PyYAML/ruamel.yaml)
+    # may be missing the `max_depth` attribute expected by speechbrain's YAML parsing.
+    # Add a safe monkey-patch to avoid AttributeError: 'Loader' object has no attribute 'max_depth'.
+    try:
+        import yaml as _pyyaml
+        for _loader_name in ("Loader", "SafeLoader"):
+            _ldr = getattr(_pyyaml, _loader_name, None)
+            if _ldr is not None and not hasattr(_ldr, 'max_depth'):
+                setattr(_ldr, 'max_depth', None)
+    except Exception:
+        pass
+
+    # Also try ruamel.yaml if present
+    try:
+        from ruamel import yaml as _ruamel_yaml
+        _rl_loader = getattr(_ruamel_yaml, 'Loader', None)
+        if _rl_loader is not None and not hasattr(_rl_loader, 'max_depth'):
+            setattr(_rl_loader, 'max_depth', None)
+    except Exception:
+        pass
+
     EncoderClassifier.from_hparams(
         source=spkrec_dir,
         savedir=spkrec_dir,
